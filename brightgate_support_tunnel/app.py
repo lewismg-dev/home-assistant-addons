@@ -8,13 +8,14 @@ Responsibilities (all inside the add-on; nothing editable in HA):
   3. Session       — homeowner grant/revoke via the Ingress panel, with an
                      auto-revoke timer.
   4. Tunnel        — bring Tailscale up + publish Serve only during a session.
+                     First registration uses an enrollment-issued auth key when
+                     present, otherwise an interactive login URL shown in the panel.
 
 No `map: config` — this service cannot read or write /config by design.
 """
 import asyncio
 import json
 import os
-import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -42,6 +43,9 @@ STAT_SENSORS = {
     "memory_pct": "sensor.system_monitor_memory_usage",
     "disk_free_gb": "sensor.system_monitor_disk_free",
 }
+
+# Tracks an in-progress interactive login (when no auth key is available).
+PENDING = {"auth_url": None}
 
 
 def _opt(key, default=None):
@@ -79,6 +83,10 @@ def portal_url():
             or "https://portal.brightgatesolutions.com.au").rstrip("/")
 
 
+def log(msg):
+    print(f"[brightgate] {msg}", flush=True)
+
+
 # ── Tailscale helpers ─────────────────────────────────────────────────────────
 async def ts(*args):
     """Run a tailscale CLI command; return (rc, stdout, stderr)."""
@@ -100,24 +108,56 @@ async def ts_status():
         return {}
 
 
-async def tunnel_up(c):
-    """Bring the node up (authkey only on first registration) and publish Serve."""
+async def is_registered():
+    """True once the node has an identity (Running or Stopped, not NeedsLogin)."""
+    return (await ts_status()).get("BackendState") in ("Running", "Stopped")
+
+
+async def _bg_up(hostname):
+    """Interactive `tailscale up` — blocks until the human approves the AuthURL."""
+    await ts("up", f"--hostname={hostname}", "--accept-routes=false",
+             "--accept-dns=false", "--ssh=false")
+    PENDING["auth_url"] = None
+
+
+async def start_login(c):
+    """Kick off interactive registration; return the Tailscale AuthURL to show."""
     hostname = c.get("support_hostname") or "brightgate-ha-support"
-    up = ["up", f"--hostname={hostname}", "--accept-routes=false",
-          "--accept-dns=false", "--ssh=false"]
-    st = await ts_status()
-    needs_login = st.get("BackendState") in (None, "NeedsLogin", "NoState")
-    authkey = c.get("tailscale_authkey")
-    if needs_login and authkey:
-        up.append(f"--authkey={authkey}")
-    rc, _, err = await ts(*up)
-    if rc != 0:
-        return False, f"tailscale up failed: {err}"
+    asyncio.create_task(_bg_up(hostname))
+    for _ in range(15):
+        url = (await ts_status()).get("AuthURL")
+        if url:
+            PENDING["auth_url"] = url
+            return url
+        await asyncio.sleep(1)
+    return None
+
+
+async def tunnel_up(c):
+    """Ensure the node is registered + connected, then publish Serve.
+
+    Returns (ok, message, auth_url). auth_url is set only when first-time
+    interactive login is required (no enrollment auth key available)."""
+    hostname = c.get("support_hostname") or "brightgate-ha-support"
+    if not await is_registered():
+        authkey = c.get("tailscale_authkey")
+        if authkey:
+            rc, _, err = await ts(
+                "up", f"--hostname={hostname}", "--accept-routes=false",
+                "--accept-dns=false", "--ssh=false", f"--authkey={authkey}")
+            if rc != 0:
+                return False, f"registration failed: {err}", None
+        else:
+            return False, "needs_login", await start_login(c)
+    # Registered: reconnect (keyless) and (re)publish Serve.
+    await ts("up", f"--hostname={hostname}", "--accept-routes=false",
+             "--accept-dns=false", "--ssh=false")
     await ts("serve", "reset")
     rc, _, err = await ts("serve", "--bg", "--https=443", HA_INTERNAL_URL)
     if rc != 0:
-        return False, f"tailscale serve failed: {err}"
-    return True, "up"
+        return False, f"serve failed: {err}", None
+    PENDING["auth_url"] = None
+    return True, "up", None
 
 
 async def tunnel_down():
@@ -135,18 +175,18 @@ async def tunnel_url():
 async def grant(hours):
     c = creds()
     if not c.get("client_id"):
-        return False, "Not enrolled yet."
+        return False, "Not enrolled yet.", None
     hours = max(1, min(24, int(hours or DEFAULT_DURATION_H)))
-    ok, msg = await tunnel_up(c)
+    ok, msg, auth_url = await tunnel_up(c)
     if not ok:
-        return False, msg
+        return False, msg, auth_url
     expires = datetime.now(timezone.utc) + timedelta(hours=hours)
     _write_json(SESSION_FILE, {
         "active": True, "granted_at": _now_iso(),
         "expires_at": expires.isoformat(), "duration_hours": hours,
     })
     asyncio.create_task(send_heartbeat())   # report support_access=on promptly
-    return True, "granted"
+    return True, "granted", None
 
 
 async def revoke():
@@ -268,10 +308,6 @@ async def session_watchdog(app):
 
 
 # ── Ingress web UI ────────────────────────────────────────────────────────────
-def log(msg):
-    print(f"[brightgate] {msg}", flush=True)
-
-
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Brightgate Support</title><style>
@@ -281,6 +317,7 @@ button{font-size:1rem;padding:10px 16px;border-radius:8px;border:0;cursor:pointe
 .grant{background:#0a7d33;color:#fff}.revoke{background:#b3261e;color:#fff}
 .muted{color:#5a6b7b;font-size:.9rem}.on{color:#0a7d33;font-weight:600}.off{color:#5a6b7b}
 input,select{font-size:1rem;padding:8px;border-radius:8px;border:1px solid #c3ccd6}
+a{color:#0a59c2}
 </style></head><body>
 <h1>🛟 Brightgate Remote Support</h1>
 <div id=app class=card>Loading…</div>
@@ -289,15 +326,18 @@ on, our support team can see the live state of your system to help you. It close
 automatically when the timer ends, or when you switch it off.</p>
 <script>
 async function api(p,opt){const r=await fetch(p,opt);return r.json()}
-function h(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function h(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 async function render(){
  const s=await api('status');const a=document.getElementById('app');
  if(!s.enrolled){a.innerHTML=`<h3>Activate this machine</h3>
    <p class=muted>Enter the enrollment code from your Brightgate portal.</p>
    <input id=code placeholder="enrollment code" size=28>
    <button class=grant onclick="doEnroll()">Activate</button><div id=msg class=muted></div>`;return}
+ if(s.auth_url){a.innerHTML=`<h3>Authorise this support node</h3>
+   <p class=muted>One-time step: open this link, approve, then come back and Grant.</p>
+   <p><a href="${h(s.auth_url)}" target=_blank rel=noopener>Open Tailscale authorisation ↗</a></p>`;return}
  if(s.active){a.innerHTML=`<p>Support access is <span class=on>ON</span></p>
-   <p class=muted>Time remaining: <b>${h(s.remaining||'')}</b></p>
+   <p class=muted>Time remaining: <b>${h(s.remaining)}</b></p>
    <button class=revoke onclick="doRevoke()">Turn off support access</button>`}
  else{a.innerHTML=`<p>Support access is <span class=off>OFF</span></p>
    <label>Duration:&nbsp;<select id=hours><option>1</option><option>2</option><option>4</option><option>8</option></select> hour(s)</label><br><br>
@@ -306,8 +346,9 @@ async function doEnroll(){document.getElementById('msg').textContent='Activating
  const r=await api('enroll',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({code:document.getElementById('code').value})});
  if(!r.ok)document.getElementById('msg').textContent=r.error||'Failed';else render()}
-async function doGrant(){await api('grant',{method:'POST',headers:{'Content-Type':'application/json'},
- body:JSON.stringify({hours:+document.getElementById('hours').value})});render()}
+async function doGrant(){const r=await api('grant',{method:'POST',headers:{'Content-Type':'application/json'},
+ body:JSON.stringify({hours:+document.getElementById('hours').value})});
+ if(r&&r.auth_url){alert('First-time setup: open the authorisation link, approve, then Grant again.')}render()}
 async function doRevoke(){await api('revoke',{method:'POST'});render()}
 render();setInterval(render,5000);
 </script></body></html>"""
@@ -332,8 +373,10 @@ async def h_status(req):
     c, s = creds(), session()
     return web.json_response({
         "enrolled": bool(c.get("client_id")),
+        "registered": await is_registered(),
         "active": bool(s.get("active")),
         "remaining": _remaining(s) if s.get("active") else None,
+        "auth_url": PENDING.get("auth_url"),
         "hostname": c.get("support_hostname"),
     })
 
@@ -346,13 +389,13 @@ async def h_enroll(req):
 
 async def h_grant(req):
     body = await req.json()
-    ok, msg = await grant(body.get("hours"))
-    return web.json_response({"ok": ok, "error": None if ok else msg})
+    ok, msg, auth_url = await grant(body.get("hours"))
+    return web.json_response({"ok": ok, "error": None if ok else msg, "auth_url": auth_url})
 
 
 async def h_revoke(req):
-    ok, msg = await revoke()
-    return web.json_response({"ok": ok})
+    await revoke()
+    return web.json_response({"ok": True})
 
 
 async def on_start(app):
