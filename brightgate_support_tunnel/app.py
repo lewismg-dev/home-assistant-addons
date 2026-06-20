@@ -320,6 +320,13 @@ async def send_heartbeat(http=None):
             "support_tunnel_key_expiry_disabled": not self_node.get("KeyExpiry"),
             "support_tunnel_last_granted_at": s.get("granted_at"),
             "support_tunnel_last_revoked_at": s.get("revoked_at"),
+            # Grant duration -> monitoring tier. 1d = momentary support; 1w/3mo/
+            # indefinite = monitored (portal keeps full monitoring while granted).
+            "support_duration": s.get("duration") if s.get("active") else None,
+            "support_tier": (
+                ("monitored" if s.get("duration") in ("1w", "3mo", "indef") else "momentary")
+                if s.get("active") else None
+            ),
             **stats,
         }
         url = f"{portal_url()}/api/heartbeat"
