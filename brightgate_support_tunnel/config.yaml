@@ -1,0 +1,24 @@
+name: Brightgate Support Tunnel
+version: "1.0.0"
+slug: brightgate_support_tunnel
+description: On-demand Tailscale Serve tunnel for Brightgate remote support. Off by default; exposes only Home Assistant to the Brightgate tailnet.
+url: https://brightgatesolutions.com.au
+arch:
+  - aarch64
+  - amd64
+init: false
+boot: manual
+startup: application
+host_network: false
+hassio_api: false
+homeassistant_api: false
+ingress: false
+panel_icon: mdi:lifebuoy
+options:
+  authkey: ""
+  hostname: "brightgate-ha-support"
+  ha_url: "http://homeassistant:8123"
+schema:
+  authkey: password?
+  hostname: str
+  ha_url: url

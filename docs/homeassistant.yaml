@@ -1,0 +1,98 @@
+# Brightgate Support Tunnel - Home Assistant homeowner controls
+# ============================================================================
+# These live in Home Assistant config (NOT in the add-on). Apply them on each
+# managed install so the homeowner can grant/revoke support access from the UI.
+#
+# IMPORTANT - add-on slug:
+#   When the add-on is installed from THIS GitHub repository, its slug is
+#   "<repo>_brightgate_support_tunnel" (NOT "local_..."). After installing,
+#   open the add-on page and copy the slug from the URL, then replace
+#   ADDON_SLUG below in both automations.
+# ============================================================================
+
+# ---- configuration.yaml -----------------------------------------------------
+# Merge these under the matching top-level keys. If input_select already exists,
+# add brightgate_support_duration under the existing input_select: key.
+
+input_boolean:
+  brightgate_support_access:
+    name: Brightgate Support Access
+    icon: mdi:lifebuoy
+
+timer:
+  brightgate_support_session:
+    name: Brightgate Support Session
+    icon: mdi:lifebuoy
+    restore: true
+
+input_select:
+  brightgate_support_duration:
+    name: Brightgate Support Duration (hours)
+    options:
+      - "1"
+      - "2"
+      - "4"
+      - "8"
+    icon: mdi:timer-outline
+
+# ---- automations.yaml (append; replace ADDON_SLUG) --------------------------
+
+- id: brightgate_support_grant
+  alias: Brightgate Support Access Granted
+  description: Starts the Brightgate Support Tunnel add-on and session timer when access is granted
+  triggers:
+    - trigger: state
+      entity_id: input_boolean.brightgate_support_access
+      to: "on"
+  mode: single
+  actions:
+    - action: timer.start
+      target:
+        entity_id: timer.brightgate_support_session
+      data:
+        duration: "{{ '%02d:00:00' % (states('input_select.brightgate_support_duration') | int(1)) }}"
+    - action: hassio.addon_start
+      data:
+        addon: ADDON_SLUG
+
+- id: brightgate_support_revoke
+  alias: Brightgate Support Access Revoked
+  description: Stops the Brightgate Support Tunnel add-on when access is turned off
+  triggers:
+    - trigger: state
+      entity_id: input_boolean.brightgate_support_access
+      to: "off"
+  mode: single
+  actions:
+    - action: timer.cancel
+      target:
+        entity_id: timer.brightgate_support_session
+    - action: hassio.addon_stop
+      data:
+        addon: ADDON_SLUG
+
+- id: brightgate_support_timeout
+  alias: Brightgate Support Access Auto-Revoke
+  description: Turns off support access when the session timer finishes
+  triggers:
+    - trigger: event
+      event_type: timer.finished
+      event_data:
+        entity_id: timer.brightgate_support_session
+  mode: single
+  actions:
+    - action: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.brightgate_support_access
+
+# ---- Dashboard card (add via Edit Dashboard -> Add Card -> Manual) ----------
+# type: entities
+# title: Brightgate Remote Support
+# show_header_toggle: false
+# entities:
+#   - entity: input_boolean.brightgate_support_access
+#     name: Grant Brightgate support access
+#   - entity: input_select.brightgate_support_duration
+#     name: Access duration (hours)
+#   - entity: timer.brightgate_support_session
+#     name: Time remaining
