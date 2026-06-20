@@ -1,28 +1,42 @@
-# Brightgate Support Tunnel
+# Brightgate Connector
 
-On-demand [Tailscale](https://tailscale.com) Serve node for Brightgate Solutions remote
-support. It is **off by default** and, when started, exposes **only Home Assistant**
-to the Brightgate tailnet (`support@brightgatesolutions.com.au`). No subnet routes, no
-exit node, no DNS — minimal blast radius. It runs in **userspace networking** mode so it
-never conflicts with a client's own (kernel-mode) Tailscale add-on.
+Self-enrolling remote-support connector for Brightgate Solutions. It is **off by
+default** and, during a granted session, exposes **only Home Assistant** to the
+Brightgate tailnet via [Tailscale](https://tailscale.com) Serve. No subnet routes,
+no exit node, no DNS — minimal blast radius. Userspace networking, so it never
+conflicts with a client's own Tailscale add-on.
+
+This is **vendor-managed infrastructure** — the homeowner controls only the
+grant/revoke switch on the add-on's own panel. There are no HA helpers,
+automations, `rest_command`s, or editable dashboards to break.
+
+## What it does
+1. **Enrollment** — open the add-on's panel and paste the **enrollment code** from
+   the Brightgate portal. The connector exchanges it for this client's credentials
+   (`client_id`, heartbeat secret, support hostname) and stores them in `/data`.
+2. **Heartbeat** — every 10 minutes it reports liveness + basic system health +
+   tunnel state to the portal (outbound; works even when support is off).
+3. **Grant/revoke** — the homeowner grants time-limited access from the panel. On
+   grant it brings Tailscale up and publishes Serve; on revoke or timer expiry it
+   tears the tunnel down.
 
 ## Options
 | Option | Meaning |
 |--------|---------|
-| `authkey` | Ephemeral, tagged Tailscale auth key (`tag:ha-support`). Leave blank to authenticate interactively via the log. Never stored in YAML/dashboards. |
-| `hostname` | Node name on the tailnet, e.g. `client-smith-ha-support`. |
-| `ha_url` | Local Home Assistant URL to proxy. Default `http://homeassistant:8123`. |
+| `portal_url` | Brightgate portal base URL. Default `https://portal.brightgatesolutions.com.au`. |
+| `log_level` | `debug` / `info` / `warning` / `error`. |
 
-## How access works
-1. Brightgate (or the portal) sets a fresh ephemeral `authkey` and **starts** the add-on.
-2. The node joins the tailnet and serves HA at `https://<hostname>.<tailnet>.ts.net`.
-3. **Stopping** the add-on removes the Serve proxy; the ephemeral node drops off the tailnet.
+No secrets, client IDs, or hostnames are configured by hand — they come from the
+portal at enrollment.
 
 ## Requirements on the Brightgate tailnet
-- MagicDNS + HTTPS certificates **enabled** (needed for `tailscale serve --https`).
+- MagicDNS + HTTPS certificates **enabled** (for `tailscale serve --https`).
 - An ACL granting Brightgate admins access to `tag:ha-support:443` only.
-- Ephemeral, reusable, tagged auth keys (or an OAuth client) for provisioning.
+- A portal `POST /api/enroll` endpoint that issues per-client credentials (and,
+  optionally, a tagged auth key so first registration is zero-touch).
 
-## Replication
-This add-on lives in the Brightgate add-on repository. New client installs add the repo
-URL once (or via the portal) and install — no per-client file copying.
+## Per-machine install
+Add the Brightgate add-on repository once, install **Brightgate Connector**, open
+its panel, paste the enrollment code. Done — no YAML, no per-client file edits.
+The only golden-image prerequisite is `http: trusted_proxies: [172.30.32.0/23]`
+so Tailscale Serve's reverse proxy is accepted.
