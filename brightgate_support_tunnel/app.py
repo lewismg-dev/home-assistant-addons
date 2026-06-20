@@ -4,12 +4,14 @@ Brightgate Connector — add-on-owned remote-support service.
 
 Responsibilities (all inside the add-on; nothing editable in HA):
   1. Enrollment    — one-time code -> portal /api/enroll -> creds in /data.
-  2. Heartbeat     — outbound liveness/telemetry to the portal every 10 min.
-  3. Session       — homeowner grant/revoke via the Ingress panel, with an
-                     auto-revoke timer.
-  4. Tunnel        — bring Tailscale up + publish Serve only during a session.
-                     First registration uses an enrollment-issued auth key when
-                     present, otherwise an interactive login URL shown in the panel.
+  2. Heartbeat     — outbound liveness/telemetry to the portal every 10 min
+                     (full field set: version, cpu/mem/disk, temp, updates,
+                     backup, watchman, entity health, uptimes + tunnel state).
+  3. Events        — listens for the HA event "brightgate_support_event" (raised
+                     by the notify_brightgate script) and forwards to the portal,
+                     so HA automations can alert Brightgate with no secret in HA.
+  4. Session       — homeowner grant/revoke via the Ingress panel + auto-revoke.
+  5. Tunnel        — bring Tailscale up + publish Serve only during a session.
 
 No `map: config` — this service cannot read or write /config by design.
 """
@@ -31,18 +33,11 @@ TS_SOCKET = os.environ.get("TS_SOCKET", "/var/run/tailscale/tailscaled.sock")
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 CORE_API = "http://supervisor/core/api"
+CORE_WS = "http://supervisor/core/websocket"
 HA_INTERNAL_URL = "http://homeassistant:8123"
 HEARTBEAT_INTERVAL_S = 600           # 10 minutes
 SESSION_TICK_S = 20                  # how often we check for auto-revoke
 DEFAULT_DURATION_H = 1
-
-# System Monitor sensors we opportunistically include in the heartbeat. Missing
-# ones are simply omitted — the portal treats them all as optional.
-STAT_SENSORS = {
-    "cpu_pct": "sensor.system_monitor_processor_use",
-    "memory_pct": "sensor.system_monitor_memory_usage",
-    "disk_free_gb": "sensor.system_monitor_disk_free",
-}
 
 # Tracks an in-progress interactive login (when no auth key is available).
 PENDING = {"auth_url": None}
@@ -213,7 +208,6 @@ async def enroll(code, http):
                 return False, body.get("error", f"Enrollment failed ({r.status}).")
     except Exception as e:
         return False, f"Could not reach portal: {e}"
-    # Persist the credentials the portal issued.
     saved = {
         "client_id": body["client_id"],
         "heartbeat_secret": body["heartbeat_secret"],
@@ -226,8 +220,29 @@ async def enroll(code, http):
     return True, "enrolled"
 
 
+def _num(st, eid):
+    s = st.get(eid)
+    if not s:
+        return None
+    v = s.get("state")
+    if v in (None, "unknown", "unavailable", ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _txt(st, eid):
+    s = st.get(eid)
+    v = s.get("state") if s else None
+    return v if v not in (None, "unknown", "unavailable", "") else None
+
+
 async def ha_stats(http):
-    """Best-effort HA telemetry for the heartbeat (all fields optional)."""
+    """Best-effort HA telemetry for the heartbeat. All fields optional — the
+    portal accepts whatever subset is present. Mirrors the v1 heartbeat so the
+    portal alert engine + dashboards keep working for v2 clients."""
     headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
     out = {}
     try:
@@ -237,17 +252,41 @@ async def ha_stats(http):
                 out["ha_version"] = (await r.json()).get("version")
     except Exception:
         pass
-    for key, entity in STAT_SENSORS.items():
-        try:
-            async with http.get(f"{CORE_API}/states/{entity}", headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    val = (await r.json()).get("state")
-                    if val not in (None, "unknown", "unavailable"):
-                        out[key] = float(val)
-        except Exception:
-            pass
-    return out
+    try:
+        async with http.get(f"{CORE_API}/states", headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                return out
+            arr = await r.json()
+    except Exception:
+        return out
+    st = {s["entity_id"]: s for s in arr if isinstance(s, dict) and "entity_id" in s}
+    out["cpu_pct"] = _num(st, "sensor.system_monitor_processor_use")
+    out["cpu_temp_c"] = _num(st, "sensor.system_monitor_processor_temperature")
+    out["memory_pct"] = _num(st, "sensor.system_monitor_memory_usage")
+    out["memory_used_mb"] = _num(st, "sensor.system_monitor_memory_use")
+    out["disk_free_gb"] = (_num(st, "sensor.system_monitor_disk_free_config")
+                           or _num(st, "sensor.system_monitor_disk_free"))
+    out["disk_used_pct"] = _num(st, "sensor.system_monitor_disk_usage_config")
+    out["watchman_missing"] = _num(st, "sensor.watchman_missing_entities")
+    out["backup_last_ok"] = _txt(st, "sensor.backup_last_successful_automatic_backup")
+    out["host_last_boot"] = _txt(st, "sensor.system_monitor_last_boot")
+    out["ha_last_started"] = _txt(st, "sensor.uptime")
+    out["ip_local"] = _txt(st, "sensor.system_monitor_ipv4_address_eth0")
+    now = datetime.now(timezone.utc)
+    for src, dst in (("sensor.system_monitor_last_boot", "host_uptime_seconds"),
+                     ("sensor.uptime", "ha_uptime_seconds")):
+        t = _txt(st, src)
+        if t:
+            try:
+                out[dst] = int((now - datetime.fromisoformat(t)).total_seconds())
+            except Exception:
+                pass
+    out["updates_pending"] = sum(
+        1 for s in arr if s.get("entity_id", "").startswith("update.") and s.get("state") == "on")
+    out["unavailable_entities"] = sum(1 for s in arr if s.get("state") == "unavailable")
+    out["entity_count"] = len(arr)
+    return {k: v for k, v in out.items() if v is not None}
 
 
 async def send_heartbeat(http=None):
@@ -286,6 +325,31 @@ async def send_heartbeat(http=None):
             await http.close()
 
 
+async def forward_event(http, data):
+    """Forward a HA 'brightgate_support_event' to the portal /api/ha-events."""
+    c = creds()
+    if not c.get("client_id") or not c.get("heartbeat_secret"):
+        return
+    title = (data.get("title") or "HA event")[:180]
+    payload = {
+        "client_id": c["client_id"],
+        "reported_at": _now_iso(),
+        "severity": data.get("severity") or "warning",
+        "category": data.get("category") or "system",
+        "title": title,
+        "message": data.get("message") or "",
+        "entity_id": data.get("entity_id") or "",
+        "dedupe_key": data.get("dedupe_key") or title,
+    }
+    try:
+        async with http.post(f"{portal_url()}/api/ha-events", json=payload,
+                            headers={"Authorization": f"Bearer {c['heartbeat_secret']}"},
+                            timeout=aiohttp.ClientTimeout(total=30)) as r:
+            log(f"ha-event '{title}' -> {r.status}")
+    except Exception as e:
+        log(f"forward_event error: {e}")
+
+
 # ── Background loops ──────────────────────────────────────────────────────────
 async def heartbeat_loop(app):
     http = app["http"]
@@ -305,6 +369,33 @@ async def session_watchdog(app):
             except Exception:
                 pass
         await asyncio.sleep(SESSION_TICK_S)
+
+
+async def event_listener(app):
+    """Subscribe to the HA event 'brightgate_support_event' (raised by the
+    notify_brightgate script) and forward each to the portal — so HA automations
+    can alert Brightgate with no secret living in HA."""
+    http = app["http"]
+    while True:
+        try:
+            async with http.ws_connect(CORE_WS, heartbeat=30) as ws:
+                await ws.receive()  # auth_required
+                await ws.send_json({"type": "auth", "access_token": SUPERVISOR_TOKEN})
+                if json.loads((await ws.receive()).data).get("type") != "auth_ok":
+                    await asyncio.sleep(30)
+                    continue
+                await ws.send_json({"id": 1, "type": "subscribe_events",
+                                    "event_type": "brightgate_support_event"})
+                log("event_listener subscribed")
+                async for raw in ws:
+                    if raw.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    m = json.loads(raw.data)
+                    if m.get("type") == "event":
+                        await forward_event(http, m.get("event", {}).get("data", {}))
+        except Exception as e:
+            log(f"event_listener error: {e}")
+            await asyncio.sleep(15)
 
 
 # ── Ingress web UI ────────────────────────────────────────────────────────────
@@ -401,7 +492,8 @@ async def h_revoke(req):
 async def on_start(app):
     app["http"] = aiohttp.ClientSession()
     app["tasks"] = [asyncio.create_task(heartbeat_loop(app)),
-                    asyncio.create_task(session_watchdog(app))]
+                    asyncio.create_task(session_watchdog(app)),
+                    asyncio.create_task(event_listener(app))]
     log("connector started")
 
 
