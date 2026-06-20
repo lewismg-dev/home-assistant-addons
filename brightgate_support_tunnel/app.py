@@ -7,11 +7,8 @@ Responsibilities (all inside the add-on; nothing editable in HA):
   2. Heartbeat     — outbound liveness/telemetry to the portal every 10 min
                      (full field set: version, cpu/mem/disk, temp, updates,
                      backup, watchman, entity health, uptimes + tunnel state).
-  3. Events        — listens for the HA event "brightgate_support_event" (raised
-                     by the notify_brightgate script) and forwards to the portal,
-                     so HA automations can alert Brightgate with no secret in HA.
-  4. Session       — homeowner grant/revoke via the Ingress panel + auto-revoke.
-  5. Tunnel        — bring Tailscale up + publish Serve only during a session.
+  3. Session       — homeowner grant/revoke via the Ingress panel + auto-revoke.
+  4. Tunnel        — bring Tailscale up + publish Serve only during a session.
 
 No `map: config` — this service cannot read or write /config by design.
 """
