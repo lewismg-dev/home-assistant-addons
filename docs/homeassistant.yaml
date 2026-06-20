@@ -1,98 +1,31 @@
-# Brightgate Support Tunnel - Home Assistant homeowner controls
+# Brightgate Connector (v2) — Home Assistant setup
 # ============================================================================
-# These live in Home Assistant config (NOT in the add-on). Apply them on each
-# managed install so the homeowner can grant/revoke support access from the UI.
+# v2 is self-contained. The homeowner-facing control, the heartbeat, the
+# session logic and the tunnel all live INSIDE the add-on. There are no helpers,
+# automations, rest_commands or dashboards to add per client.
 #
-# IMPORTANT - add-on slug:
-#   When the add-on is installed from THIS GitHub repository, its slug is
-#   "<repo>_brightgate_support_tunnel" (NOT "local_..."). After installing,
-#   open the add-on page and copy the slug from the URL, then replace
-#   ADDON_SLUG below in both automations.
-# ============================================================================
-
-# ---- configuration.yaml -----------------------------------------------------
-# Merge these under the matching top-level keys. If input_select already exists,
-# add brightgate_support_duration under the existing input_select: key.
-
-input_boolean:
-  brightgate_support_access:
-    name: Brightgate Support Access
-    icon: mdi:lifebuoy
-
-timer:
-  brightgate_support_session:
-    name: Brightgate Support Session
-    icon: mdi:lifebuoy
-    restore: true
-
-input_select:
-  brightgate_support_duration:
-    name: Brightgate Support Duration (hours)
-    options:
-      - "1"
-      - "2"
-      - "4"
-      - "8"
-    icon: mdi:timer-outline
-
-# ---- automations.yaml (append; replace ADDON_SLUG) --------------------------
-
-- id: brightgate_support_grant
-  alias: Brightgate Support Access Granted
-  description: Starts the Brightgate Support Tunnel add-on and session timer when access is granted
-  triggers:
-    - trigger: state
-      entity_id: input_boolean.brightgate_support_access
-      to: "on"
-  mode: single
-  actions:
-    - action: timer.start
-      target:
-        entity_id: timer.brightgate_support_session
-      data:
-        duration: "{{ '%02d:00:00' % (states('input_select.brightgate_support_duration') | int(1)) }}"
-    - action: hassio.addon_start
-      data:
-        addon: ADDON_SLUG
-
-- id: brightgate_support_revoke
-  alias: Brightgate Support Access Revoked
-  description: Stops the Brightgate Support Tunnel add-on when access is turned off
-  triggers:
-    - trigger: state
-      entity_id: input_boolean.brightgate_support_access
-      to: "off"
-  mode: single
-  actions:
-    - action: timer.cancel
-      target:
-        entity_id: timer.brightgate_support_session
-    - action: hassio.addon_stop
-      data:
-        addon: ADDON_SLUG
-
-- id: brightgate_support_timeout
-  alias: Brightgate Support Access Auto-Revoke
-  description: Turns off support access when the session timer finishes
-  triggers:
-    - trigger: event
-      event_type: timer.finished
-      event_data:
-        entity_id: timer.brightgate_support_session
-  mode: single
-  actions:
-    - action: input_boolean.turn_off
-      target:
-        entity_id: input_boolean.brightgate_support_access
-
-# ---- Dashboard card (add via Edit Dashboard -> Add Card -> Manual) ----------
-# type: entities
-# title: Brightgate Remote Support
-# show_header_toggle: false
-# entities:
-#   - entity: input_boolean.brightgate_support_access
-#     name: Grant Brightgate support access
-#   - entity: input_select.brightgate_support_duration
-#     name: Access duration (hours)
-#   - entity: timer.brightgate_support_session
-#     name: Time remaining
+# Per-machine install:
+#   1. Add the Brightgate add-on repository and install "Brightgate Connector".
+#   2. Open the add-on's panel (sidebar) and paste the enrollment code from the
+#      Brightgate portal (Client page -> Generate enrollment code).
+#   3. Done. The connector heartbeats immediately; support is granted/revoked
+#      from that same panel.
+#
+# The ONLY Home Assistant config requirement — bake this into the golden image
+# ONCE (it is identical on every machine: 172.30.32.0/23 is the Supervisor add-on
+# network, needed so Tailscale Serve's reverse proxy is accepted):
+#
+#   http:
+#     use_x_forwarded_for: true
+#     trusted_proxies:
+#       - 172.30.32.0/23
+#
+# Nothing else. No secrets, client_id, hostname, slug, or YAML per client.
+#
+# ---------------------------------------------------------------------------
+# Migrating a v1 install (had helpers + automations + rest_command):
+#   After enrolling v2, remove the old per-machine bits so there is one source
+#   of truth: input_boolean.brightgate_support_access, input_select
+#   .brightgate_support_duration, timer.brightgate_support_session, the three
+#   brightgate_support_* automations, and rest_command.brightgate_heartbeat /
+#   brightgate_event. The connector now owns all of it.
