@@ -1,60 +1,20 @@
 #!/usr/bin/env sh
-# Brightgate Support Tunnel
-# Joins the Brightgate tailnet as a userspace node and exposes ONLY Home Assistant
-# via Tailscale Serve. No subnet routes, no exit node, no DNS. Off unless started.
+# Brightgate Connector entrypoint.
+# Starts tailscaled (userspace) in the background but does NOT bring the node up.
+# The Python service (app.py) brings Tailscale up + publishes Serve only while a
+# support session is granted, and tears it down on revoke/expiry.
 set -eu
 
-CONFIG=/data/options.json
-AUTHKEY="$(jq -r '.authkey // ""' "$CONFIG")"
-HOSTNAME="$(jq -r '.hostname // "brightgate-ha-support"' "$CONFIG")"
-HA_URL="$(jq -r '.ha_url // "http://homeassistant:8123"' "$CONFIG")"
-
 export TS_STATE_DIR=/data/tailscale
-SOCK=/var/run/tailscale/tailscaled.sock
+export TS_SOCKET=/var/run/tailscale/tailscaled.sock
 mkdir -p "$TS_STATE_DIR" /var/run/tailscale
 
-echo "[brightgate] starting tailscaled (userspace) ..."
+echo "[brightgate] starting tailscaled (userspace, idle until a session is granted) ..."
 tailscaled \
   --statedir="$TS_STATE_DIR" \
-  --socket="$SOCK" \
+  --socket="$TS_SOCKET" \
   --tun=userspace-networking &
-TSD_PID=$!
 
-# Wait for the daemon socket
-i=0
-while [ ! -S "$SOCK" ] && [ "$i" -lt 30 ]; do
-  sleep 1
-  i=$((i + 1))
-done
-if [ ! -S "$SOCK" ]; then
-  echo "[brightgate] ERROR: tailscaled socket never appeared" >&2
-  exit 1
-fi
-
-echo "[brightgate] bringing node up as '${HOSTNAME}' ..."
-if [ -n "$AUTHKEY" ]; then
-  tailscale up \
-    --authkey="$AUTHKEY" \
-    --hostname="$HOSTNAME" \
-    --accept-routes=false \
-    --accept-dns=false \
-    --ssh=false
-else
-  echo "[brightgate] No authkey set in add-on options."
-  echo "[brightgate] Bringing up interactively - watch this log for the login URL,"
-  echo "[brightgate] approve into the support@brightgatesolutions.com.au tailnet."
-  tailscale up \
-    --hostname="$HOSTNAME" \
-    --accept-routes=false \
-    --accept-dns=false \
-    --ssh=false
-fi
-
-echo "[brightgate] exposing Home Assistant (${HA_URL}) via Tailscale Serve ..."
-# Reset any prior serve config, then publish HA on tailnet HTTPS only.
-tailscale serve reset || true
-tailscale serve --bg --https=443 "$HA_URL"
-tailscale serve status || true
-
-echo "[brightgate] support tunnel is up. Stopping the add-on tears it down."
-wait "$TSD_PID"
+# Hand off to the connector service. It owns enrollment, the Ingress UI, the
+# heartbeat loop, and session/tunnel control.
+exec python3 /app.py
