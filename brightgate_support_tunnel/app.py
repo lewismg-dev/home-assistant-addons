@@ -37,7 +37,15 @@ CORE_WS = "http://supervisor/core/websocket"
 HA_INTERNAL_URL = "http://homeassistant:8123"
 HEARTBEAT_INTERVAL_S = 600           # 10 minutes
 SESSION_TICK_S = 20                  # how often we check for auto-revoke
-DEFAULT_DURATION_H = 1
+
+# Homeowner-selectable grant durations. None = indefinite (no auto-revoke).
+DURATIONS = {
+    "1d": 24 * 3600,
+    "1w": 7 * 24 * 3600,
+    "3mo": 90 * 24 * 3600,
+    "indef": None,
+}
+DEFAULT_DURATION = "1d"
 
 # Tracks an in-progress interactive login (when no auth key is available).
 PENDING = {"auth_url": None}
@@ -167,19 +175,20 @@ async def tunnel_url():
 
 
 # ── Session control ───────────────────────────────────────────────────────────
-async def grant(hours):
+async def grant(duration):
     c = creds()
     if not c.get("client_id"):
         return False, "Not enrolled yet.", None
-    hours = max(1, min(24, int(hours or DEFAULT_DURATION_H)))
+    if duration not in DURATIONS:
+        duration = DEFAULT_DURATION
     ok, msg, auth_url = await tunnel_up(c)
     if not ok:
         return False, msg, auth_url
-    expires = datetime.now(timezone.utc) + timedelta(hours=hours)
-    _write_json(SESSION_FILE, {
-        "active": True, "granted_at": _now_iso(),
-        "expires_at": expires.isoformat(), "duration_hours": hours,
-    })
+    sess = {"active": True, "granted_at": _now_iso(), "duration": duration}
+    secs = DURATIONS[duration]
+    if secs is not None:  # None = indefinite -> no expiry, no auto-revoke
+        sess["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
+    _write_json(SESSION_FILE, sess)
     asyncio.create_task(send_heartbeat())   # report support_access=on promptly
     return True, "granted", None
 
@@ -431,14 +440,14 @@ async function render(){
    <p class=muted>Time remaining: <b>${h(s.remaining)}</b></p>
    <button class=revoke onclick="doRevoke()">Turn off support access</button>`}
  else{a.innerHTML=`<p>Support access is <span class=off>OFF</span></p>
-   <label>Duration:&nbsp;<select id=hours><option>1</option><option>2</option><option>4</option><option>8</option></select> hour(s)</label><br><br>
+   <label>Grant for:&nbsp;<select id=dur><option value=1d>1 day</option><option value=1w>1 week</option><option value=3mo>3 months</option><option value=indef>Indefinite</option></select></label><br><br>
    <button class=grant onclick="doGrant()">Grant Brightgate support access</button>`}}
 async function doEnroll(){document.getElementById('msg').textContent='Activating…';
  const r=await api('enroll',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({code:document.getElementById('code').value})});
  if(!r.ok)document.getElementById('msg').textContent=r.error||'Failed';else render()}
 async function doGrant(){const r=await api('grant',{method:'POST',headers:{'Content-Type':'application/json'},
- body:JSON.stringify({hours:+document.getElementById('hours').value})});
+ body:JSON.stringify({duration:document.getElementById('dur').value})});
  if(r&&r.auth_url){alert('First-time setup: open the authorisation link, approve, then Grant again.')}render()}
 async function doRevoke(){await api('revoke',{method:'POST'});render()}
 render();setInterval(render,5000);
@@ -446,12 +455,17 @@ render();setInterval(render,5000);
 
 
 def _remaining(s):
+    if not s.get("expires_at"):
+        return "no expiry (until revoked)"
     try:
         secs = int((datetime.fromisoformat(s["expires_at"]) -
                     datetime.now(timezone.utc)).total_seconds())
         if secs < 0:
             return "0:00"
-        return f"{secs // 3600}:{(secs % 3600) // 60:02d}"
+        d, h, m = secs // 86400, (secs % 86400) // 3600, (secs % 3600) // 60
+        if d:
+            return f"{d}d {h}h"
+        return f"{h}:{m:02d}"
     except Exception:
         return ""
 
@@ -480,7 +494,7 @@ async def h_enroll(req):
 
 async def h_grant(req):
     body = await req.json()
-    ok, msg, auth_url = await grant(body.get("hours"))
+    ok, msg, auth_url = await grant(body.get("duration"))
     return web.json_response({"ok": ok, "error": None if ok else msg, "auth_url": auth_url})
 
 
