@@ -33,7 +33,6 @@ TS_SOCKET = os.environ.get("TS_SOCKET", "/var/run/tailscale/tailscaled.sock")
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 CORE_API = "http://supervisor/core/api"
-CORE_WS = "http://supervisor/core/websocket"
 HA_INTERNAL_URL = "http://homeassistant:8123"
 HEARTBEAT_INTERVAL_S = 600           # 10 minutes
 SESSION_TICK_S = 20                  # how often we check for auto-revoke
@@ -341,31 +340,6 @@ async def send_heartbeat(http=None):
             await http.close()
 
 
-async def forward_event(http, data):
-    """Forward a HA 'brightgate_support_event' to the portal /api/ha-events."""
-    c = creds()
-    if not c.get("client_id") or not c.get("heartbeat_secret"):
-        return
-    title = (data.get("title") or "HA event")[:180]
-    payload = {
-        "client_id": c["client_id"],
-        "reported_at": _now_iso(),
-        "severity": data.get("severity") or "warning",
-        "category": data.get("category") or "system",
-        "title": title,
-        "message": data.get("message") or "",
-        "entity_id": data.get("entity_id") or "",
-        "dedupe_key": data.get("dedupe_key") or title,
-    }
-    try:
-        async with http.post(f"{portal_url()}/api/ha-events", json=payload,
-                            headers={"Authorization": f"Bearer {c['heartbeat_secret']}"},
-                            timeout=aiohttp.ClientTimeout(total=30)) as r:
-            log(f"ha-event '{title}' -> {r.status}")
-    except Exception as e:
-        log(f"forward_event error: {e}")
-
-
 # ── Background loops ──────────────────────────────────────────────────────────
 async def heartbeat_loop(app):
     http = app["http"]
@@ -385,33 +359,6 @@ async def session_watchdog(app):
             except Exception:
                 pass
         await asyncio.sleep(SESSION_TICK_S)
-
-
-async def event_listener(app):
-    """Subscribe to the HA event 'brightgate_support_event' (raised by the
-    notify_brightgate script) and forward each to the portal — so HA automations
-    can alert Brightgate with no secret living in HA."""
-    http = app["http"]
-    while True:
-        try:
-            async with http.ws_connect(CORE_WS, heartbeat=30) as ws:
-                await ws.receive()  # auth_required
-                await ws.send_json({"type": "auth", "access_token": SUPERVISOR_TOKEN})
-                if json.loads((await ws.receive()).data).get("type") != "auth_ok":
-                    await asyncio.sleep(30)
-                    continue
-                await ws.send_json({"id": 1, "type": "subscribe_events",
-                                    "event_type": "brightgate_support_event"})
-                log("event_listener subscribed")
-                async for raw in ws:
-                    if raw.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    m = json.loads(raw.data)
-                    if m.get("type") == "event":
-                        await forward_event(http, m.get("event", {}).get("data", {}))
-        except Exception as e:
-            log(f"event_listener error: {e}")
-            await asyncio.sleep(15)
 
 
 # ── Ingress web UI ────────────────────────────────────────────────────────────
@@ -513,8 +460,7 @@ async def h_revoke(req):
 async def on_start(app):
     app["http"] = aiohttp.ClientSession()
     app["tasks"] = [asyncio.create_task(heartbeat_loop(app)),
-                    asyncio.create_task(session_watchdog(app)),
-                    asyncio.create_task(event_listener(app))]
+                    asyncio.create_task(session_watchdog(app))]
     log("connector started")
 
 
