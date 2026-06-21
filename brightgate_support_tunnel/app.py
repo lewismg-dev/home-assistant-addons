@@ -69,6 +69,15 @@ def _write_json(path, obj):
     path.write_text(json.dumps(obj, indent=2))
 
 
+def _update_creds(remove=(), **patch):
+    current = creds()
+    for key in remove:
+        current.pop(key, None)
+    current.update(patch)
+    _write_json(CREDS_FILE, current)
+    return current
+
+
 def creds():
     return _read_json(CREDS_FILE, {})
 
@@ -146,6 +155,7 @@ async def tunnel_up(c):
                 "--accept-dns=false", "--ssh=false", f"--authkey={authkey}")
             if rc != 0:
                 return False, f"registration failed: {err}", None
+            _update_creds(remove=("tailscale_authkey",))
         else:
             return False, "needs_login", await start_login(c)
     # Registered: reconnect (keyless) and (re)publish Serve.

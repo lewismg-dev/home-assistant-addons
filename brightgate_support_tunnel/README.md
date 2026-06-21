@@ -29,6 +29,10 @@ automations, `rest_command`s, or editable dashboards to break.
 No secrets, client IDs, or hostnames are configured by hand — they come from the
 portal at enrollment.
 
+If the portal returns a one-time Tailscale auth key for first registration, the
+connector removes that key from `/data` after `tailscale up` succeeds. The node
+then reconnects from its saved Tailscale identity.
+
 ## Requirements on the Brightgate tailnet
 - MagicDNS + HTTPS certificates **enabled** (for `tailscale serve --https`).
 - An ACL granting Brightgate admins access to `tag:ha-support:443` only.
