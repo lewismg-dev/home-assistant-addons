@@ -1,5 +1,5 @@
 name: Brightgate Connector
-version: "2.4.1"
+version: "2.4.3"
 slug: brightgate_support_tunnel
 description: >-
   Brightgate remote support — self-enrolling connector. Owns the on-demand

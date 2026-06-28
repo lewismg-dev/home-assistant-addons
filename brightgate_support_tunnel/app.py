@@ -9,6 +9,9 @@ Responsibilities (all inside the add-on; nothing editable in HA):
                      backup, watchman, entity health, uptimes + tunnel state).
   3. Session       — homeowner grant/revoke via the Ingress panel + auto-revoke.
   4. Tunnel        — bring Tailscale up + publish Serve only during a session.
+  5. Log bundles   — on a portal request (carried in the heartbeat reply),
+                     collect the relevant HA logs and upload them to the portal
+                     for support/AI triage. Read-only, best-effort, log-only.
 
 No `map: config` — this service cannot read or write /config by design.
 """
@@ -33,6 +36,8 @@ CORE_API = "http://supervisor/core/api"
 HA_INTERNAL_URL = "http://homeassistant:8123"
 HEARTBEAT_INTERVAL_S = 600           # 10 minutes
 SESSION_TICK_S = 20                  # how often we check for auto-revoke
+LOG_TAIL_BYTES = 200_000             # cap per text log section in a bundle
+SYSTEM_LOG_MAX = 100                 # cap structured system_log entries
 
 # Homeowner-selectable grant durations. None = indefinite (no auto-revoke).
 DURATIONS = {
@@ -45,6 +50,10 @@ DEFAULT_DURATION = "1d"
 
 # Tracks an in-progress interactive login (when no auth key is available).
 PENDING = {"auth_url": None}
+
+# Log-collection request ids currently being gathered/uploaded, so a request
+# the portal keeps echoing in the heartbeat reply isn't collected twice.
+LOG_REQUESTS_IN_FLIGHT = set()
 
 
 def _opt(key, default=None):
@@ -91,8 +100,18 @@ def portal_url():
             or "https://portal.brightgatesolutions.com.au").rstrip("/")
 
 
-def log(msg):
-    print(f"[brightgate] {msg}", flush=True)
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Severity is gated by the add-on `log_level` option (config.yaml). Routine
+# heartbeats are debug; grant/revoke/enrolment are audited at info so the
+# support-access history is always visible in the add-on log. Never log the
+# heartbeat_secret or a Tailscale auth key — client_id is a non-secret id.
+_LOG_LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40}
+_LOG_THRESHOLD = _LOG_LEVELS.get((_opt("log_level") or "info").lower(), 20)
+
+
+def log(msg, level="info"):
+    if _LOG_LEVELS.get(level, 20) >= _LOG_THRESHOLD:
+        print(f"[brightgate] {level.upper():<7} {msg}", flush=True)
 
 
 # ── Tailscale helpers ─────────────────────────────────────────────────────────
@@ -154,6 +173,7 @@ async def tunnel_up(c):
                 "up", f"--hostname={hostname}", "--accept-routes=false",
                 "--accept-dns=false", "--ssh=false", f"--authkey={authkey}")
             if rc != 0:
+                log(f"tailscale registration failed: {err}", "error")
                 return False, f"registration failed: {err}", None
             _update_creds(remove=("tailscale_authkey",))
         else:
@@ -189,12 +209,16 @@ async def grant(duration):
         duration = DEFAULT_DURATION
     ok, msg, auth_url = await tunnel_up(c)
     if not ok:
+        if msg != "needs_login":
+            log(f"grant failed: {msg}", "warning")
         return False, msg, auth_url
     sess = {"active": True, "granted_at": _now_iso(), "duration": duration}
     secs = DURATIONS[duration]
     if secs is not None:  # None = indefinite -> no expiry, no auto-revoke
         sess["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
     _write_json(SESSION_FILE, sess)
+    log(f"support access GRANTED (duration={duration}, "
+        f"expires={sess.get('expires_at') or 'never'})")
     asyncio.create_task(send_heartbeat())   # report support_access=on promptly
     return True, "granted", None
 
@@ -202,8 +226,11 @@ async def grant(duration):
 async def revoke():
     await tunnel_down()
     s = session()
+    was_active = s.get("active")
     s.update({"active": False, "revoked_at": _now_iso()})
     _write_json(SESSION_FILE, s)
+    if was_active:
+        log("support access REVOKED")
     asyncio.create_task(send_heartbeat())
     return True, "revoked"
 
@@ -220,18 +247,26 @@ async def enroll(code, http):
                              timeout=aiohttp.ClientTimeout(total=30)) as r:
             body = await r.json()
             if r.status != 200:
-                return False, body.get("error", f"Enrollment failed ({r.status}).")
+                msg = body.get("error", f"Enrollment failed ({r.status}).")
+                log(f"enrolment rejected by portal ({r.status})", "warning")
+                return False, msg
     except Exception as e:
+        log(f"enrolment could not reach portal: {e}", "warning")
         return False, f"Could not reach portal: {e}"
-    saved = {
-        "client_id": body["client_id"],
-        "heartbeat_secret": body["heartbeat_secret"],
-        "support_hostname": body.get("support_hostname"),
-        "portal_url": body.get("portal_url", url),
-        "tailscale_authkey": body.get("tailscale_authkey"),
-        "enrolled_at": _now_iso(),
-    }
+    try:
+        saved = {
+            "client_id": body["client_id"],
+            "heartbeat_secret": body["heartbeat_secret"],
+            "support_hostname": body.get("support_hostname"),
+            "portal_url": body.get("portal_url", url),
+            "tailscale_authkey": body.get("tailscale_authkey"),
+            "enrolled_at": _now_iso(),
+        }
+    except KeyError as e:
+        log(f"enrolment response missing field {e}", "error")
+        return False, "Portal returned an incomplete enrolment response."
     _write_json(CREDS_FILE, saved)
+    log(f"enrolled as client_id={saved['client_id']}")
     return True, "enrolled"
 
 
@@ -337,14 +372,124 @@ async def send_heartbeat(http=None):
         }
         url = f"{portal_url()}/api/heartbeat"
         headers = {"Authorization": f"Bearer {c['heartbeat_secret']}"}
+        reply = {}
         async with http.post(url, json=payload, headers=headers,
                             timeout=aiohttp.ClientTimeout(total=30)) as r:
-            log(f"heartbeat -> {r.status}")
+            log(f"heartbeat -> {r.status}", "debug" if r.status == 200 else "warning")
+            try:
+                reply = await r.json()
+            except Exception:
+                reply = {}
+        await _handle_commands(http, reply)
     except Exception as e:
-        log(f"heartbeat error: {e}")
+        log(f"heartbeat error: {e}", "warning")
     finally:
         if own:
             await http.close()
+
+
+# ── Log collection ────────────────────────────────────────────────────────────
+# On a portal request (the `commands.collect_logs` field in the heartbeat
+# reply) the connector gathers the relevant HA logs and uploads them to the
+# portal. Everything here is read-only and best-effort: any section that can't
+# be fetched is simply omitted, and a failure never affects the heartbeat or
+# any household behaviour. Logs are tail-capped so a bundle stays bounded.
+async def _fetch_text(http, url, headers, limit):
+    """GET a text log endpoint; return its last `limit` bytes, or None."""
+    try:
+        async with http.get(url, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                return None
+            txt = await r.text()
+    except Exception:
+        return None
+    return txt[-limit:] if len(txt) > limit else txt
+
+
+async def ha_system_log(http):
+    """Structured recent errors/warnings via the Core WebSocket — deduped with
+    occurrence counts. Best-effort: returns [] on any failure."""
+    try:
+        async with http.ws_connect("ws://supervisor/core/websocket",
+                                   timeout=aiohttp.ClientTimeout(total=20)) as ws:
+            await ws.receive_json()  # auth_required greeting
+            await ws.send_json({"type": "auth", "access_token": SUPERVISOR_TOKEN})
+            if (await ws.receive_json()).get("type") != "auth_ok":
+                return []
+            await ws.send_json({"id": 1, "type": "system_log/list"})
+            msg = await ws.receive_json()
+    except Exception:
+        return []
+    out = []
+    for it in (msg.get("result") or [])[:SYSTEM_LOG_MAX]:
+        m = it.get("message")
+        m = m[0] if isinstance(m, list) and m else m
+        src = it.get("source")
+        src = src[0] if isinstance(src, list) and src else src
+        out.append({
+            "level": it.get("level"),
+            "count": it.get("count"),
+            "first_occurred": it.get("first_occurred"),
+            "last_occurred": it.get("timestamp"),
+            "source": src,
+            "message": (str(m)[:500] if m is not None else None),
+        })
+    return out
+
+
+async def collect_logs(http):
+    """Gather the relevant logs into one bounded bundle. Each section is
+    independent and optional."""
+    sup = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
+    return {
+        "collected_at": _now_iso(),
+        "core_log": await _fetch_text(http, "http://supervisor/core/logs", sup, LOG_TAIL_BYTES),
+        "supervisor_log": await _fetch_text(http, "http://supervisor/supervisor/logs", sup, LOG_TAIL_BYTES),
+        "system_log": await ha_system_log(http),
+    }
+
+
+async def upload_log_bundle(http, request_id):
+    """Collect logs and POST them to the portal, authed like the heartbeat."""
+    c = creds()
+    if not c.get("client_id") or not c.get("heartbeat_secret"):
+        return
+    bundle = await collect_logs(http)
+    payload = {
+        "client_id": c["client_id"],
+        "request_id": request_id,
+        "collected_at": bundle["collected_at"],
+        "logs": bundle,
+    }
+    url = f"{portal_url()}/api/logs/upload"
+    headers = {"Authorization": f"Bearer {c['heartbeat_secret']}"}
+    try:
+        async with http.post(url, json=payload, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60)) as r:
+            log(f"log bundle upload (request={request_id}) -> {r.status}",
+                "info" if r.status < 300 else "warning")
+    except Exception as e:
+        log(f"log bundle upload error: {e}", "warning")
+
+
+async def _handle_commands(http, reply):
+    """Act on commands the portal returns in the heartbeat reply. Currently
+    only `collect_logs` (a request id). De-duped so a request the portal keeps
+    echoing until the upload lands isn't collected repeatedly."""
+    req = ((reply or {}).get("commands") or {}).get("collect_logs")
+    if not req or req in LOG_REQUESTS_IN_FLIGHT:
+        return
+    LOG_REQUESTS_IN_FLIGHT.add(req)
+    log(f"portal requested log collection (request={req})")
+
+    async def _run():
+        try:
+            await upload_log_bundle(http, req)
+        finally:
+            LOG_REQUESTS_IN_FLIGHT.discard(req)
+
+    asyncio.create_task(_run())
 
 
 # ── Background loops ──────────────────────────────────────────────────────────
