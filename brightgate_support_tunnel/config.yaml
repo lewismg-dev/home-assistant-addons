@@ -1,5 +1,5 @@
 name: Brightgate Connector
-version: "2.4.5"
+version: "2.4.6"
 slug: brightgate_support_tunnel
 description: >-
   Brightgate remote support — self-enrolling connector. Owns the on-demand
@@ -15,15 +15,16 @@ init: false
 boot: auto
 startup: services
 host_network: false
-# homeassistant_api: read HA stats (version/states) for the heartbeat via the
-# Supervisor proxy. hassio_api: read our own add-on/version info.
-# hassio_role homeassistant: the MINIMUM role that can read `/core/logs` (the
-# Core log the portal needs). We deliberately do NOT use `manager`: that would
-# also unlock `/supervisor/logs`, but at the price of Supervisor-wide privileges
-# (install/start/stop/uninstall add-ons, etc.). Least privilege — a compromised
-# connector can read the Core log and nothing more. The Supervisor log is
-# therefore not collected (see collect_logs in app.py); `/supervisor/logs` 403s
-# at this role by design.
+# homeassistant_api: read HA stats (version/states) for the heartbeat AND the
+# Core WebSocket `system_log` used for the support bundle — both via the
+# Supervisor proxy, gated by homeassistant_api (NOT hassio_role). hassio_api:
+# read our own add-on/version info.
+# hassio_role homeassistant: least privilege. NOTE: this role CANNOT read the
+# Supervisor text logs — `/core/logs` and `/supervisor/logs` require `manager`
+# (Supervisor-wide privileges: install/start/stop/uninstall add-ons, etc.), and
+# return 403 here by design. So the support bundle is built from the Core
+# `system_log` (deduped errors/warnings) instead, which DOES work at this role.
+# core_log/supervisor_log are intentionally null — see collect_logs in app.py.
 # NOTE: no `map:` entry on purpose — the add-on still cannot touch /config, which
 # is the tamper-isolation we want. The role grants Supervisor *API* read access,
 # not filesystem access.

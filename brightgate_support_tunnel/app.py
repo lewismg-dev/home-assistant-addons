@@ -36,7 +36,6 @@ CORE_API = "http://supervisor/core/api"
 HA_INTERNAL_URL = "http://homeassistant:8123"
 HEARTBEAT_INTERVAL_S = 600           # 10 minutes
 SESSION_TICK_S = 20                  # how often we check for auto-revoke
-LOG_TAIL_BYTES = 200_000             # cap per text log section in a bundle
 SYSTEM_LOG_MAX = 100                 # cap structured system_log entries
 
 # Homeowner-selectable grant durations. None = indefinite (no auto-revoke).
@@ -393,34 +392,28 @@ async def send_heartbeat(http=None):
 # reply) the connector gathers the relevant HA logs and uploads them to the
 # portal. Everything here is read-only and best-effort: any section that can't
 # be fetched is simply omitted, and a failure never affects the heartbeat or
-# any household behaviour. Logs are tail-capped so a bundle stays bounded.
-async def _fetch_text(http, url, headers, limit):
-    """GET a text log endpoint; return its last `limit` bytes, or None."""
-    try:
-        async with http.get(url, headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=30)) as r:
-            if r.status != 200:
-                return None
-            txt = await r.text()
-    except Exception:
-        return None
-    return txt[-limit:] if len(txt) > limit else txt
-
-
+# any household behaviour. The bundle is bounded (system_log is capped at
+# SYSTEM_LOG_MAX entries, each message truncated).
 async def ha_system_log(http):
     """Structured recent errors/warnings via the Core WebSocket — deduped with
-    occurrence counts. Best-effort: returns [] on any failure."""
+    occurrence counts. Returns (entries, error): error is None on success, else
+    a short string explaining the failure (so an empty bundle is never silent).
+    This path is gated by `homeassistant_api`, NOT `hassio_role`, so it works at
+    the connector's least-privilege `homeassistant` role."""
     try:
         async with http.ws_connect("ws://supervisor/core/websocket",
                                    timeout=aiohttp.ClientTimeout(total=20)) as ws:
             await ws.receive_json()  # auth_required greeting
             await ws.send_json({"type": "auth", "access_token": SUPERVISOR_TOKEN})
-            if (await ws.receive_json()).get("type") != "auth_ok":
-                return []
+            auth = await ws.receive_json()
+            if auth.get("type") != "auth_ok":
+                return [], f"ws auth not ok: {auth.get('type')} {auth.get('message', '')}".strip()
             await ws.send_json({"id": 1, "type": "system_log/list"})
             msg = await ws.receive_json()
-    except Exception:
-        return []
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    if not msg.get("success", True):
+        return [], f"system_log/list error: {msg.get('error')}"
     out = []
     for it in (msg.get("result") or [])[:SYSTEM_LOG_MAX]:
         m = it.get("message")
@@ -435,21 +428,30 @@ async def ha_system_log(http):
             "source": src,
             "message": (str(m)[:500] if m is not None else None),
         })
-    return out
+    return out, None
 
 
 async def collect_logs(http):
-    """Gather the relevant logs into one bounded bundle. Each section is
-    independent and optional. `supervisor_log` is intentionally not collected:
-    reading `/supervisor/logs` requires the `manager` role (Supervisor-wide
-    privileges), so we run at the narrower `homeassistant` role (see config.yaml)
-    and leave it null. The key is kept so the bundle schema stays stable."""
-    sup = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
+    """Gather the triage bundle. The connector runs at the least-privilege
+    `homeassistant` role, which CANNOT read the Supervisor text logs
+    (`/core/logs`, `/supervisor/logs` need `manager`). So the bundle is built
+    around the Core `system_log` (deduped errors/warnings), which is gated by
+    `homeassistant_api` and works at our role. `core_log`/`supervisor_log` keys
+    are kept null so the portal schema stays stable, and a `diagnostics` block
+    records exactly what happened — an empty bundle is never silent again."""
+    entries, sys_err = await ha_system_log(http)
     return {
         "collected_at": _now_iso(),
-        "core_log": await _fetch_text(http, "http://supervisor/core/logs", sup, LOG_TAIL_BYTES),
-        "supervisor_log": None,  # not collected at `homeassistant` role — see config.yaml
-        "system_log": await ha_system_log(http),
+        "core_log": None,        # unavailable at `homeassistant` role (needs `manager`)
+        "supervisor_log": None,  # unavailable at `homeassistant` role (needs `manager`)
+        "system_log": entries,
+        "diagnostics": {
+            "hassio_role": "homeassistant",
+            "system_log_count": len(entries),
+            "system_log_error": sys_err,
+            "note": "core_log/supervisor_log require hassio_role=manager; "
+                    "omitted by design for least privilege.",
+        },
     }
 
 
