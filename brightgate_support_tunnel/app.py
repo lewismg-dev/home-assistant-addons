@@ -440,12 +440,15 @@ async def ha_system_log(http):
 
 async def collect_logs(http):
     """Gather the relevant logs into one bounded bundle. Each section is
-    independent and optional."""
+    independent and optional. `supervisor_log` is intentionally not collected:
+    reading `/supervisor/logs` requires the `manager` role (Supervisor-wide
+    privileges), so we run at the narrower `homeassistant` role (see config.yaml)
+    and leave it null. The key is kept so the bundle schema stays stable."""
     sup = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
     return {
         "collected_at": _now_iso(),
         "core_log": await _fetch_text(http, "http://supervisor/core/logs", sup, LOG_TAIL_BYTES),
-        "supervisor_log": await _fetch_text(http, "http://supervisor/supervisor/logs", sup, LOG_TAIL_BYTES),
+        "supervisor_log": None,  # not collected at `homeassistant` role — see config.yaml
         "system_log": await ha_system_log(http),
     }
 
